@@ -1,4 +1,4 @@
-// +build !windows
+// +build !wasm
 
 package buf
 
@@ -6,69 +6,91 @@ import (
 	"io"
 	"runtime"
 	"syscall"
-	"unsafe"
 
 	"v2ray.com/core/common/platform"
 )
 
-type ReadVReader struct {
-	io.Reader
-	rawConn syscall.RawConn
-	iovects []syscall.Iovec
-	nBuf    int32
+type allocStrategy struct {
+	current uint32
 }
 
-func NewReadVReader(reader io.Reader, rawConn syscall.RawConn) *ReadVReader {
-	return &ReadVReader{
-		Reader:  reader,
-		rawConn: rawConn,
-		nBuf:    1,
+func (s *allocStrategy) Current() uint32 {
+	return s.current
+}
+
+func (s *allocStrategy) Adjust(n uint32) {
+	if n >= s.current {
+		s.current *= 4
+	} else {
+		s.current = n
+	}
+
+	if s.current > 32 {
+		s.current = 32
+	}
+
+	if s.current == 0 {
+		s.current = 1
 	}
 }
 
-func allocN(n int32) []*Buffer {
-	bs := make([]*Buffer, 0, n)
-	for i := int32(0); i < n; i++ {
-		bs = append(bs, New())
+func (s *allocStrategy) Alloc() []*Buffer {
+	bs := make([]*Buffer, s.current)
+	for i := range bs {
+		bs[i] = New()
 	}
 	return bs
 }
 
+type multiReader interface {
+	Init([]*Buffer)
+	Read(fd uintptr) int32
+	Clear()
+}
+
+// ReadVReader is a Reader that uses readv(2) syscall to read data.
+type ReadVReader struct {
+	io.Reader
+	rawConn syscall.RawConn
+	mr      multiReader
+	alloc   allocStrategy
+}
+
+// NewReadVReader creates a new ReadVReader.
+func NewReadVReader(reader io.Reader, rawConn syscall.RawConn) *ReadVReader {
+	return &ReadVReader{
+		Reader:  reader,
+		rawConn: rawConn,
+		alloc: allocStrategy{
+			current: 1,
+		},
+		mr: newMultiReader(),
+	}
+}
+
 func (r *ReadVReader) readMulti() (MultiBuffer, error) {
-	bs := allocN(r.nBuf)
+	bs := r.alloc.Alloc()
 
-	var iovecs []syscall.Iovec
-	if r.iovects != nil {
-		iovecs = r.iovects
-	}
-	for idx, b := range bs {
-		iovecs = append(iovecs, syscall.Iovec{
-			Base: &(b.v[0]),
-		})
-		iovecs[idx].SetLen(int(Size))
-	}
-	r.iovects = iovecs[:0]
-
-	var nBytes int
-
+	r.mr.Init(bs)
+	var nBytes int32
 	err := r.rawConn.Read(func(fd uintptr) bool {
-		n, _, e := syscall.Syscall(syscall.SYS_READV, fd, uintptr(unsafe.Pointer(&iovecs[0])), uintptr(len(iovecs)))
-		if e != 0 {
+		n := r.mr.Read(fd)
+		if n < 0 {
 			return false
 		}
-		nBytes = int(n)
+
+		nBytes = n
 		return true
 	})
+	r.mr.Clear()
 
 	if err != nil {
-		mb := MultiBuffer(bs)
-		mb.Release()
+		ReleaseMulti(MultiBuffer(bs))
 		return nil, err
 	}
 
 	if nBytes == 0 {
-		mb := MultiBuffer(bs)
-		mb.Release()
+		ReleaseMulti(MultiBuffer(bs))
 		return nil, io.EOF
 	}
 
@@ -77,12 +99,12 @@ func (r *ReadVReader) readMulti() (MultiBuffer, error) {
 		if nBytes <= 0 {
 			break
 		}
-		end := int32(nBytes)
+		end := nBytes
 		if end > Size {
 			end = Size
 		}
 		bs[nBuf].end = end
-		nBytes -= int(end)
+		nBytes -= end
 		nBuf++
 	}
 
@@ -96,27 +118,22 @@ func (r *ReadVReader) readMulti() (MultiBuffer, error) {
 
 // ReadMultiBuffer implements Reader.
 func (r *ReadVReader) ReadMultiBuffer() (MultiBuffer, error) {
-	if r.nBuf == 1 {
-		b, err := readOne(r.Reader)
+	if r.alloc.Current() == 1 {
+		b, err := ReadBuffer(r.Reader)
 		if err != nil {
 			return nil, err
 		}
 		if b.IsFull() {
-			r.nBuf = 2
+			r.alloc.Adjust(1)
 		}
-		return NewMultiBufferValue(b), nil
+		return MultiBuffer{b}, nil
 	}
 
 	mb, err := r.readMulti()
 	if err != nil {
 		return nil, err
 	}
-	nBuf := int32(len(mb))
-	if nBuf < r.nBuf {
-		r.nBuf = nBuf
-	} else if nBuf == r.nBuf && r.nBuf < 16 {
-		r.nBuf *= 4
-	}
+	r.alloc.Adjust(uint32(len(mb)))
 	return mb, nil
 }
 
@@ -125,7 +142,12 @@ var useReadv = false
 func init() {
 	const defaultFlagValue = "NOT_DEFINED_AT_ALL"
 	value := platform.NewEnvFlag("v2ray.buf.readv").GetValue(func() string { return defaultFlagValue })
-	if value != defaultFlagValue && (runtime.GOOS == "linux" || runtime.GOOS == "darwin") {
+	switch value {
+	case defaultFlagValue, "auto":
+		if (runtime.GOARCH == "386" || runtime.GOARCH == "amd64" || runtime.GOARCH == "s390x") && (runtime.GOOS == "linux" || runtime.GOOS == "darwin" || runtime.GOOS == "windows") {
+			useReadv = true
+		}
+	case "enable":
 		useReadv = true
 	}
 }

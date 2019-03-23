@@ -2,6 +2,7 @@ package buf
 
 import (
 	"io"
+	"net"
 	"syscall"
 	"time"
 )
@@ -26,20 +27,6 @@ type Writer interface {
 	WriteMultiBuffer(MultiBuffer) error
 }
 
-// ReadFrom creates a Supplier to read from a given io.Reader.
-func ReadFrom(reader io.Reader) Supplier {
-	return func(b []byte) (int, error) {
-		return reader.Read(b)
-	}
-}
-
-// ReadFullFrom creates a Supplier to read full buffer from a given io.Reader.
-func ReadFullFrom(reader io.Reader, size int32) Supplier {
-	return func(b []byte) (int, error) {
-		return io.ReadFull(reader, b[:size])
-	}
-}
-
 // WriteAllBytes ensures all bytes are written into the given writer.
 func WriteAllBytes(writer io.Writer, payload []byte) error {
 	for len(payload) > 0 {
@@ -52,11 +39,22 @@ func WriteAllBytes(writer io.Writer, payload []byte) error {
 	return nil
 }
 
+func isPacketReader(reader io.Reader) bool {
+	_, ok := reader.(net.PacketConn)
+	return ok
+}
+
 // NewReader creates a new Reader.
 // The Reader instance doesn't take the ownership of reader.
 func NewReader(reader io.Reader) Reader {
 	if mr, ok := reader.(Reader); ok {
 		return mr
+	}
+
+	if isPacketReader(reader) {
+		return &PacketReader{
+			Reader: reader,
+		}
 	}
 
 	if useReadv {
@@ -70,7 +68,32 @@ func NewReader(reader io.Reader) Reader {
 		}
 	}
 
-	return NewBytesToBufferReader(reader)
+	return &SingleReader{
+		Reader: reader,
+	}
+}
+
+// NewPacketReader creates a new PacketReader based on the given reader.
+func NewPacketReader(reader io.Reader) Reader {
+	if mr, ok := reader.(Reader); ok {
+		return mr
+	}
+
+	return &PacketReader{
+		Reader: reader,
+	}
+}
+
+func isPacketWriter(writer io.Writer) bool {
+	if _, ok := writer.(net.PacketConn); ok {
+		return true
+	}
+
+	// If the writer doesn't implement syscall.Conn, it is probably not a TCP connection.
+	if _, ok := writer.(syscall.Conn); !ok {
+		return true
+	}
+	return false
 }
 
 // NewWriter creates a new Writer.
@@ -79,8 +102,7 @@ func NewWriter(writer io.Writer) Writer {
 		return mw
 	}
 
-	if _, ok := writer.(syscall.Conn); !ok {
-		// If the writer doesn't implement syscall.Conn, it is probably not a TCP connection.
+	if isPacketWriter(writer) {
 		return &SequentialWriter{
 			Writer: writer,
 		}
